@@ -2,11 +2,12 @@
 #include <vector>
 #include <Wire.h>
 #include "SSD1306Wire.h"
-#include <LoRa.h>
+#include <SPI.h>
+#include <RadioLib.h>
 
 void waitForWaypoints();
 void updateDisplay();
-void sendWaypointsViaLoRa();
+bool sendWaypointsViaLoRa();
 void processTelemetry(uint8_t* data, int size);
 void displayTelemetry();
 void listenForTelemetry();
@@ -18,32 +19,28 @@ uint8_t calculateChecksum(uint8_t* data, size_t len);
 #define OLED_RST 16
 
 // Pines LoRa para Heltec WiFi LoRa 32 V2
-#define LORA_SCK 5
+#define LORA_SCK  5
 #define LORA_MISO 19
 #define LORA_MOSI 27
-#define LORA_SS 18
-#define LORA_RST 14
+#define LORA_CS   18
+#define LORA_RST  14
 #define LORA_DIO0 26
-
-// Configuración LoRa
-#define LORA_FREQUENCY 868E6  // 868 MHz (Europa)
-#define LORA_BANDWIDTH 125E3
-#define LORA_SPREADING_FACTOR 7
+#define LORA_DIO1 35
 
 // Protocolo
-#define MSG_REQUEST_WAYPOINTS 0x01
-#define MSG_WAYPOINT_DATA 0x02
-#define MSG_END_TRANSMISSION 0x03
-#define MSG_ACK 0x04
+#define MSG_REQUEST_WAYPOINTS  0x01
+#define MSG_WAYPOINT_DATA      0x02
+#define MSG_END_TRANSMISSION   0x03
+#define MSG_ACK                0x04
 #define MSG_START_TRANSMISSION 0x05
-#define MSG_TELEMETRY 0x06        // Telemetría del robot
-#define MSG_TELEMETRY_ACK 0x07    // ACK de telemetría (opcional)
+#define MSG_TELEMETRY          0x06
 
-#define MAX_RETRIES 5
-#define ACK_TIMEOUT 8000  // 8 segundos (aumentado para dar más tiempo al vehículo)
-#define POST_SEND_DELAY 800  // 800ms después de enviar antes de buscar ACK
+#define MAX_RETRIES      5
+#define ACK_TIMEOUT      8000
+#define POST_SEND_DELAY  800
 
 SSD1306Wire display(0x3c, OLED_SDA, OLED_SCL);
+SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
 
 struct Waypoint {
   float latitude;
@@ -51,78 +48,99 @@ struct Waypoint {
 };
 
 struct __attribute__((packed)) WaypointPacket {
-  uint8_t msgType;      // Tipo de mensaje
-  uint8_t waypointId;   // ID del waypoint (1-based)
-  uint8_t totalWaypoints; // Total de waypoints
-  float latitude;
-  float longitude;
+  uint8_t msgType;
+  uint8_t waypointId;
+  uint8_t totalWaypoints;
+  float   latitude;
+  float   longitude;
   uint8_t checksum;
 };
 
 struct __attribute__((packed)) TelemetryPacket {
-  uint8_t msgType;              // MSG_TELEMETRY (0x06)
-  float latitude;               // Latitud actual del robot
-  float longitude;              // Longitud actual del robot
-  uint8_t satellites;           // Número de satélites GPS
-  uint8_t gpsFixed;             // 1 si tiene fix GPS, 0 si no
-  uint8_t currentWaypoint;      // Waypoint actual al que se dirige
-  float distanceToWaypoint;     // Distancia al waypoint en metros
-  float headingToWaypoint;      // Rumbo al waypoint en grados (0-360)
-  int16_t rssi;                 // RSSI de la última recepción LoRa
-  float snr;                    // SNR de la última recepción LoRa
-  uint8_t batteryLevel;         // Nivel de batería en % (0-100)
-  uint8_t checksum;             // Checksum simple
+  uint8_t  msgType;
+  float    latitude;
+  float    longitude;
+  uint8_t  satellites;
+  uint8_t  gpsFixed;
+  uint8_t  currentWaypoint;
+  float    distanceToWaypoint;
+  float    headingToWaypoint;
+  int16_t  rssi;
+  float    snr;
+  uint8_t  batteryLevel;
+  uint8_t  checksum;
 };
 
 std::vector<Waypoint> waypoints;
 
-// Variables para almacenar última telemetría
-float robotLatitude = 0.0;
-float robotLongitude = 0.0;
-uint8_t robotSatellites = 0;
-bool robotGpsFixed = false;
-uint8_t robotCurrentWaypoint = 0;
-float robotDistanceToWaypoint = 0.0;
-float robotHeadingToWaypoint = 0.0;
-int16_t robotRssi = 0;
-float robotSnr = 0.0;
-uint8_t robotBatteryLevel = 0;
+float    robotLatitude           = 0.0;
+float    robotLongitude          = 0.0;
+uint8_t  robotSatellites         = 0;
+bool     robotGpsFixed           = false;
+uint8_t  robotCurrentWaypoint    = 0;
+float    robotDistanceToWaypoint = 0.0;
+float    robotHeadingToWaypoint  = 0.0;
+int16_t  robotRssi               = 0;
+float    robotSnr                = 0.0;
+uint8_t  robotBatteryLevel       = 0;
 unsigned long lastTelemetryReceived = 0;
-bool missionActive = false;
+bool     missionActive           = false;
+
+// ── RadioLib: enviar un paquete y volver a RX ──────────────────
+static void loraSend(uint8_t* buf, size_t len) {
+  radio.transmit(buf, len);   // bloqueante, espera TX_DONE
+  radio.startReceive();       // volver a RX inmediatamente
+}
+
+// ── RadioLib: recibir con timeout (ms), devuelve bytes leídos o -1 ──
+static int loraReceive(uint8_t* buf, size_t maxLen, uint32_t timeoutMs) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    if (digitalRead(LORA_DIO0) == HIGH || radio.available()) {
+      size_t pktLen = radio.getPacketLength();
+      size_t readLen = (pktLen > maxLen) ? maxLen : pktLen;
+      int st = radio.readData(buf, readLen);
+      radio.startReceive();
+      if (st == RADIOLIB_ERR_NONE) return (int)readLen;
+      return -1;
+    }
+    delay(5);
+  }
+  return -1;  // timeout
+}
 
 void setup() {
   Serial.begin(115200);
-  
+
   // Reset OLED
   pinMode(OLED_RST, OUTPUT);
   digitalWrite(OLED_RST, LOW);
   delay(50);
   digitalWrite(OLED_RST, HIGH);
-  
-  // Inicializar la pantalla OLED
+
   display.init();
   display.flipScreenVertically();
   display.setFont(ArialMT_Plain_10);
   display.clear();
   display.drawString(0, 0, "Inicializando...");
   display.display();
-  
-  // Inicializar LoRa
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  
-  if (!LoRa.begin(LORA_FREQUENCY)) {
-    Serial.println("Error al inicializar LoRa");
+
+  // Inicializar LoRa con RadioLib
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+
+  // SF7, BW125, CR5, sync=0x14, pwr=14, preamble=8
+  int st = radio.begin(868.0f, 125.0f, 7, 5, 0x14, 14, 8);
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.printf("Error LoRa: %d\r\n", st);
     display.clear();
     display.drawString(0, 0, "Error LoRa!");
     display.display();
     while (1);
   }
-  
-  LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-  LoRa.setSignalBandwidth(LORA_BANDWIDTH);
-  
-  Serial.println("LoRa inicializado correctamente");
+  radio.setCRC(false);
+  radio.startReceive();
+
+  Serial.println("LoRa OK (RadioLib SX1276)");
   display.clear();
   display.drawString(0, 0, "LoRa OK - 868MHz");
   display.drawString(0, 12, "Esperando waypoints...");
@@ -132,79 +150,75 @@ void setup() {
 
 void loop() {
   waitForWaypoints();
-  
-  // Esperar solicitud del vehículo
+
   display.clear();
   display.drawString(0, 0, "Waypoints listos");
   display.drawString(0, 12, String(waypoints.size()) + " waypoints");
   display.drawString(0, 24, "Esperando solicitud");
   display.drawString(0, 36, "del vehículo...");
   display.display();
-  
+
   Serial.println("Esperando solicitud del vehículo...");
-  
+
   while (true) {
-    int packetSize = LoRa.parsePacket();
-    if (packetSize) {
-      uint8_t msgType = LoRa.read();
-      
-      if (msgType == MSG_REQUEST_WAYPOINTS) {
-        Serial.println("Solicitud recibida. Enviando waypoints...");
-        display.clear();
-        display.drawString(0, 0, "Solicitud recibida!");
-        display.drawString(0, 12, "Enviando waypoints...");
-        display.display();
-        
-        sendWaypointsViaLoRa();
-        
-        // Activar modo de escucha de telemetría
-        missionActive = true;
-        display.clear();
-        display.drawString(0, 0, "Waypoints enviados");
-        display.drawString(0, 12, "Esperando telemetría");
-        display.display();
-        delay(2000);
-        
-        // Entrar en modo de monitoreo de telemetría
-        listenForTelemetry();
+    uint8_t rxBuf[64];
+    int rxLen = loraReceive(rxBuf, sizeof(rxBuf), 100);
+    if (rxLen >= 1 && rxBuf[0] == MSG_REQUEST_WAYPOINTS) {
+      Serial.println("Solicitud recibida. Enviando waypoints...");
+      display.clear();
+      display.drawString(0, 0, "Solicitud recibida!");
+      display.drawString(0, 12, "Enviando waypoints...");
+      display.display();
+
+      while (!sendWaypointsViaLoRa()) {
+        Serial.println("[WP] Transmision interrumpida — esperando nueva solicitud...");
+        bool gotRequest = false;
+        unsigned long t0 = millis();
+        while (millis() - t0 < 30000) {
+          int r = loraReceive(rxBuf, sizeof(rxBuf), 100);
+          if (r >= 1 && rxBuf[0] == MSG_REQUEST_WAYPOINTS) { gotRequest = true; break; }
+        }
+        if (!gotRequest) break;
+        Serial.println("[WP] Nueva solicitud — reenviando waypoints...");
       }
+
+      missionActive = true;
+      display.clear();
+      display.drawString(0, 0, "Waypoints enviados");
+      display.drawString(0, 12, "Esperando telemetria");
+      display.display();
+      delay(2000);
+
+      listenForTelemetry();
     }
-    delay(100);
   }
 }
 
 void waitForWaypoints() {
   Serial.println("Esperando waypoints (formato: lat,lon). Escribe 'start' para comenzar.");
-  
+
   display.clear();
   display.drawString(0, 0, "Esperando waypoints");
   display.drawString(0, 12, "Formato: lat,lon");
   display.display();
-  
-  float lat, lon;
-  
+
   while (true) {
     if (Serial.available() > 0) {
       String input = Serial.readStringUntil('\n');
       input.trim();
-      
+
       if (input.equalsIgnoreCase("start")) {
         Serial.println("Iniciando con " + String(waypoints.size()) + " waypoints.");
         updateDisplay();
         break;
       }
-      
+
       int commaIndex = input.indexOf(',');
       if (commaIndex > 0) {
-        lat = input.substring(0, commaIndex).toFloat();
-        lon = input.substring(commaIndex + 1).toFloat();
-        
-        Waypoint wp = {lat, lon};
-        waypoints.push_back(wp);
-        
+        float lat = input.substring(0, commaIndex).toFloat();
+        float lon = input.substring(commaIndex + 1).toFloat();
+        waypoints.push_back({lat, lon});
         Serial.println("Waypoint añadido: Lat=" + String(lat, 6) + ", Lon=" + String(lon, 6));
-        
-        // Actualizar pantalla con el waypoint añadido
         display.clear();
         display.drawString(0, 0, "Waypoints: " + String(waypoints.size()));
         display.drawString(0, 12, "Último:");
@@ -222,112 +236,84 @@ void waitForWaypoints() {
 void updateDisplay() {
   display.clear();
   display.drawString(0, 0, "Total: " + String(waypoints.size()) + " waypoints");
-  
-  // Mostrar los primeros waypoints en la pantalla
   int linea = 12;
-  for (int i = 0; i < waypoints.size() && i < 4; i++) {
+  for (int i = 0; i < (int)waypoints.size() && i < 4; i++) {
     String wp = String(i+1) + ": " + String(waypoints[i].latitude, 2) + "," + String(waypoints[i].longitude, 2);
     display.drawString(0, linea, wp);
     linea += 12;
   }
-  
-  if (waypoints.size() > 4) {
-    display.drawString(0, 52, "... y mas");
-  }
-  
+  if (waypoints.size() > 4) display.drawString(0, 52, "... y mas");
   display.display();
 }
 
-void sendWaypointsViaLoRa() {
-  // Enviar mensaje de inicio de transmisión
-  LoRa.beginPacket();
-  LoRa.write(MSG_START_TRANSMISSION);
-  LoRa.write((uint8_t)waypoints.size());
-  LoRa.endPacket();
-  
+bool sendWaypointsViaLoRa() {
+  delay(500);
+
+  uint8_t startPkt[2] = {MSG_START_TRANSMISSION, (uint8_t)waypoints.size()};
+  loraSend(startPkt, sizeof(startPkt));
   Serial.println("Enviando START_TRANSMISSION con " + String(waypoints.size()) + " waypoints");
-  delay(1000);  // Aumentado de 500ms a 1s para dar tiempo al vehículo
-  
-  // Enviar cada waypoint
-  for (int i = 0; i < waypoints.size(); i++) {
+  delay(1000);
+
+  for (int i = 0; i < (int)waypoints.size(); i++) {
     WaypointPacket packet;
-    packet.msgType = MSG_WAYPOINT_DATA;
-    packet.waypointId = i + 1;
+    packet.msgType        = MSG_WAYPOINT_DATA;
+    packet.waypointId     = i + 1;
     packet.totalWaypoints = waypoints.size();
-    packet.latitude = waypoints[i].latitude;
-    packet.longitude = waypoints[i].longitude;
-    
-    // Calcular checksum (excluye el campo checksum)
-    packet.checksum = calculateChecksum((uint8_t*)&packet, sizeof(WaypointPacket) - 1);
-    
+    packet.latitude       = waypoints[i].latitude;
+    packet.longitude      = waypoints[i].longitude;
+    packet.checksum       = calculateChecksum((uint8_t*)&packet, sizeof(WaypointPacket) - 1);
+
     bool ackReceived = false;
-    int retries = 0;
-    
+    int  retries     = 0;
+
     while (!ackReceived && retries < MAX_RETRIES) {
-      // Enviar waypoint
-      LoRa.beginPacket();
-      LoRa.write((uint8_t*)&packet, sizeof(WaypointPacket));
-      LoRa.endPacket();
-      
-      Serial.println("Enviando waypoint " + String(packet.waypointId) + "/" + String(packet.totalWaypoints) + 
+      loraSend((uint8_t*)&packet, sizeof(WaypointPacket));
+      Serial.println("Enviando waypoint " + String(packet.waypointId) + "/" + String(packet.totalWaypoints) +
                      " (intento " + String(retries + 1) + ")");
-      
       display.clear();
       display.drawString(0, 0, "Enviando WP " + String(packet.waypointId) + "/" + String(packet.totalWaypoints));
       display.drawString(0, 12, "Intento: " + String(retries + 1));
       display.drawString(0, 24, "Lat: " + String(packet.latitude, 4));
       display.drawString(0, 36, "Lon: " + String(packet.longitude, 4));
       display.display();
-      
-      // Delay para dar tiempo al vehículo a procesar y preparar ACK
+
       delay(POST_SEND_DELAY);
-      
-      // Esperar ACK
+
       unsigned long startTime = millis();
-      bool timeout = false;
-      
-      while (!timeout && !ackReceived) {
-        // Verificar timeout
-        if (millis() - startTime >= ACK_TIMEOUT) {
-          timeout = true;
-          break;
-        }
-        
-        // Buscar paquete ACK
-        int packetSize = LoRa.parsePacket();
-        if (packetSize >= 2) {
-          uint8_t msgType = LoRa.read();
-          uint8_t ackWaypointId = LoRa.read();
-          
-          Serial.print("RX: msgType=0x");
-          Serial.print(msgType, HEX);
-          Serial.print(", waypointId=");
-          Serial.println(ackWaypointId);
-          
-          if (msgType == MSG_ACK && ackWaypointId == packet.waypointId) {
+      while (millis() - startTime < ACK_TIMEOUT && !ackReceived) {
+        uint8_t rxBuf[64];
+        int rxLen = loraReceive(rxBuf, sizeof(rxBuf), 50);
+        if (rxLen >= 1) {
+          uint8_t msgType    = rxBuf[0];
+          uint8_t secondByte = (rxLen >= 2) ? rxBuf[1] : 0;
+          Serial.printf("RX: msgType=0x%02X waypointId=%d\r\n", msgType, secondByte);
+
+          if (msgType == MSG_ACK && secondByte == packet.waypointId) {
             ackReceived = true;
-            Serial.println("✓ ACK recibido para waypoint " + String(packet.waypointId));
+            Serial.println("ACK recibido para waypoint " + String(packet.waypointId));
             display.clear();
             display.drawString(0, 0, "ACK recibido!");
             display.drawString(0, 12, "WP " + String(packet.waypointId) + "/" + String(packet.totalWaypoints));
             display.display();
             delay(300);
-            break;
+          } else if (msgType == MSG_TELEMETRY) {
+            processTelemetry(rxBuf, rxLen);
+          } else if (msgType == MSG_REQUEST_WAYPOINTS) {
+            Serial.println("[WP] Robot re-solicito waypoints — reiniciando transmision");
+            return false;
           }
         }
-        
-        delay(50);  // Aumentado de 10ms a 50ms para dar más tiempo entre chequeos
       }
-      
+
       if (!ackReceived) {
         retries++;
-        Serial.println("✗ Timeout esperando ACK. Reintento " + String(retries) + "/" + String(MAX_RETRIES));
-        delay(300);  // Reducido de 200ms a 100ms entre reintentos
+        Serial.println("Timeout ACK. Reintento " + String(retries) + "/" + String(MAX_RETRIES));
+        delay(300);
       }
     }
-    
+
     if (!ackReceived) {
-      Serial.println("ERROR: No se recibió ACK para waypoint " + String(packet.waypointId) + " después de " + String(MAX_RETRIES) + " intentos");
+      Serial.println("ERROR: No ACK para waypoint " + String(packet.waypointId));
       display.clear();
       display.drawString(0, 0, "ERROR!");
       display.drawString(0, 12, "WP " + String(packet.waypointId) + " sin ACK");
@@ -335,159 +321,102 @@ void sendWaypointsViaLoRa() {
       delay(2000);
     }
   }
-  
-  // Enviar mensaje de fin de transmisión
-  delay(500);  // Pequeña pausa antes del END
-  LoRa.beginPacket();
-  LoRa.write(MSG_END_TRANSMISSION);
-  LoRa.endPacket();
-  
+
+  delay(500);
+  uint8_t endPkt[1] = {MSG_END_TRANSMISSION};
+  loraSend(endPkt, sizeof(endPkt));
   Serial.println("Enviando END_TRANSMISSION");
   display.clear();
-  display.drawString(0, 0, "Transmisión");
+  display.drawString(0, 0, "Transmision");
   display.drawString(0, 12, "completa!");
   display.display();
   delay(2000);
+  return true;
 }
 
 uint8_t calculateChecksum(uint8_t* data, size_t len) {
   uint8_t checksum = 0;
-  for (size_t i = 0; i < len; i++) {
-    checksum ^= data[i];
-  }
+  for (size_t i = 0; i < len; i++) checksum ^= data[i];
   return checksum;
 }
 
 void processTelemetry(uint8_t* data, int size) {
   if (size != sizeof(TelemetryPacket)) {
-    Serial.println("[Telemetry] Tamaño de paquete incorrecto");
+    Serial.println("[Telemetry] Tamaño incorrecto");
     return;
   }
-  
   TelemetryPacket* packet = (TelemetryPacket*)data;
-  
-  // Validar checksum
   uint8_t sum = 0;
-  for (size_t i = 0; i < sizeof(TelemetryPacket) - 1; i++) {
-    sum += data[i];
-  }
-  
+  for (size_t i = 0; i < sizeof(TelemetryPacket) - 1; i++) sum += data[i];
   if (sum != packet->checksum) {
-    Serial.println("[Telemetry] Checksum inválido");
+    Serial.println("[Telemetry] Checksum invalido");
     return;
   }
-  
-  // Actualizar variables globales
-  robotLatitude = packet->latitude;
-  robotLongitude = packet->longitude;
-  robotSatellites = packet->satellites;
-  robotGpsFixed = packet->gpsFixed;
-  robotCurrentWaypoint = packet->currentWaypoint;
+
+  robotLatitude           = packet->latitude;
+  robotLongitude          = packet->longitude;
+  robotSatellites         = packet->satellites;
+  robotGpsFixed           = packet->gpsFixed;
+  robotCurrentWaypoint    = packet->currentWaypoint;
   robotDistanceToWaypoint = packet->distanceToWaypoint;
-  robotHeadingToWaypoint = packet->headingToWaypoint;
-  robotRssi = packet->rssi;
-  robotSnr = packet->snr;
-  robotBatteryLevel = packet->batteryLevel;
-  lastTelemetryReceived = millis();
-  
-  // Mostrar en Serial
-  Serial.println("\n========== TELEMETRÍA ROBOT ==========");
-  Serial.print("Posición: ");
-  Serial.print(robotLatitude, 6);
-  Serial.print(", ");
-  Serial.println(robotLongitude, 6);
-  Serial.print("Satélites: ");
-  Serial.print(robotSatellites);
-  Serial.print(" | GPS Fix: ");
-  Serial.println(robotGpsFixed ? "SI" : "NO");
-  Serial.print("Waypoint actual: ");
-  Serial.print(robotCurrentWaypoint + 1);
-  Serial.print(" | Distancia: ");
-  Serial.print(robotDistanceToWaypoint, 1);
-  Serial.println(" m");
-  Serial.print("Rumbo: ");
-  Serial.print(robotHeadingToWaypoint, 1);
-  Serial.println("°");
-  Serial.print("RSSI: ");
-  Serial.print(robotRssi);
-  Serial.print(" dBm | SNR: ");
-  Serial.print(robotSnr, 1);
-  Serial.println(" dB");
-  Serial.print("Batería: ");
-  Serial.print(robotBatteryLevel);
-  Serial.println("%");
+  robotHeadingToWaypoint  = packet->headingToWaypoint;
+  robotRssi               = packet->rssi;
+  robotSnr                = packet->snr;
+  robotBatteryLevel       = packet->batteryLevel;
+  lastTelemetryReceived   = millis();
+
+  Serial.println("\n========== TELEMETRIA ROBOT ==========");
+  Serial.printf("Posicion: %.6f, %.6f\r\n", robotLatitude, robotLongitude);
+  Serial.printf("Satelites: %d | GPS Fix: %s\r\n", robotSatellites, robotGpsFixed ? "SI" : "NO");
+  Serial.printf("Waypoint actual: %d | Distancia: %.1f m\r\n", robotCurrentWaypoint + 1, robotDistanceToWaypoint);
+  Serial.printf("Rumbo: %.1f°\r\n", robotHeadingToWaypoint);
+  Serial.printf("RSSI: %d dBm | SNR: %.1f dB\r\n", robotRssi, robotSnr);
+  Serial.printf("Bateria: %d%%\r\n", robotBatteryLevel);
   Serial.println("======================================\n");
-  
-  // Mostrar en OLED
+
   displayTelemetry();
 }
 
 void displayTelemetry() {
   display.clear();
   display.setFont(ArialMT_Plain_10);
-  
-  // Título
   display.drawString(0, 0, "TELEMETRIA ROBOT");
-  
   if (robotGpsFixed) {
-    // Línea 1: Posición (fuente más pequeña)
     String pos = String(robotLatitude, 4) + "," + String(robotLongitude, 4);
-    display.setFont(ArialMT_Plain_10);
-    // Si el texto es muy largo, usar coordenadas más cortas
-    if (pos.length() > 20) {
-      pos = String(robotLatitude, 3) + "," + String(robotLongitude, 3);
-    }
+    if (pos.length() > 20) pos = String(robotLatitude, 3) + "," + String(robotLongitude, 3);
     display.drawString(0, 12, pos);
-    
-    // Línea 2: Waypoint y distancia
-    String wp = "WP" + String(robotCurrentWaypoint + 1) + " " + String(robotDistanceToWaypoint, 0) + "m";
-    display.drawString(0, 24, wp);
-    
-    // Línea 3: Rumbo y satélites
-    String nav = String(robotHeadingToWaypoint, 0) + "° S:" + String(robotSatellites);
-    display.drawString(0, 36, nav);
-    
-    // Línea 4: Radio y batería
-    String radio = "R:" + String(robotRssi) + " B:" + String(robotBatteryLevel) + "%";
-    display.drawString(0, 48, radio);
-    
+    display.drawString(0, 24, "WP" + String(robotCurrentWaypoint + 1) + " " + String(robotDistanceToWaypoint, 0) + "m");
+    display.drawString(0, 36, String(robotHeadingToWaypoint, 0) + "° S:" + String(robotSatellites));
+    display.drawString(0, 48, "R:" + String(robotRssi) + " B:" + String(robotBatteryLevel) + "%");
   } else {
     display.drawString(0, 28, "Sin GPS Fix");
-    String sats = "Sats: " + String(robotSatellites);
-    display.drawString(0, 40, sats);
+    display.drawString(0, 40, "Sats: " + String(robotSatellites));
   }
-  
   display.display();
 }
 
 void listenForTelemetry() {
-  Serial.println("\n[Sistema] Escuchando telemetría del robot...");
-  
+  Serial.println("\n[Sistema] Escuchando telemetria del robot...");
   while (true) {
-    int packetSize = LoRa.parsePacket();
-    
-    if (packetSize) {
-      // Leer todo el paquete
-      uint8_t rxBuffer[256];
-      int bytesRead = 0;
-      
-      while (LoRa.available() && bytesRead < 256) {
-        rxBuffer[bytesRead++] = LoRa.read();
-      }
-      
-      if (bytesRead > 0) {
-        uint8_t msgType = rxBuffer[0];
-        
-        if (msgType == MSG_TELEMETRY) {
-          processTelemetry(rxBuffer, bytesRead);
-        } else {
-          Serial.print("[LoRa] Mensaje desconocido: 0x");
-          Serial.println(msgType, HEX);
-        }
+    uint8_t rxBuf[256];
+    int rxLen = loraReceive(rxBuf, sizeof(rxBuf), 100);
+    if (rxLen >= 1) {
+      uint8_t msgType = rxBuf[0];
+      if (msgType == MSG_TELEMETRY) {
+        processTelemetry(rxBuf, rxLen);
+      } else if (msgType == MSG_REQUEST_WAYPOINTS) {
+        Serial.println("[LoRa] Nueva solicitud de waypoints — reenviando...");
+        display.clear();
+        display.drawString(0, 0, "Nueva solicitud WP");
+        display.drawString(0, 12, "Reenviando...");
+        display.display();
+        sendWaypointsViaLoRa();
+        Serial.println("[Sistema] Volviendo a escuchar telemetria...");
+      } else {
+        Serial.printf("[LoRa] Mensaje desconocido: 0x%02X\r\n", msgType);
       }
     }
-    
-    // Verificar timeout de telemetría (10 segundos sin señal)
+
     if (missionActive && millis() - lastTelemetryReceived > 10000 && lastTelemetryReceived > 0) {
       display.clear();
       display.drawString(0, 0, "WARNING");
@@ -495,11 +424,5 @@ void listenForTelemetry() {
       display.drawString(0, 28, "> 10 segundos");
       display.display();
     }
-    
-    delay(10);
   }
 }
-
-//Ejemplo de latitud longitud 
-// 37.7749,-122.4195//Ejemplo de latitud longitud 
-// 37.7749,-122.4195
