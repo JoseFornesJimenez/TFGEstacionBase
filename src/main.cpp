@@ -43,23 +43,23 @@ SSD1306Wire display(0x3c, OLED_SDA, OLED_SCL);
 SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST, LORA_DIO1);
 
 struct Waypoint {
-  float latitude;
-  float longitude;
+  double latitude;
+  double longitude;
 };
 
 struct __attribute__((packed)) WaypointPacket {
   uint8_t msgType;
   uint8_t waypointId;
   uint8_t totalWaypoints;
-  float   latitude;
-  float   longitude;
+  int32_t latitude;   // microgrados × 1e6
+  int32_t longitude;  // microgrados × 1e6
   uint8_t checksum;
 };
 
 struct __attribute__((packed)) TelemetryPacket {
   uint8_t  msgType;
-  float    latitude;
-  float    longitude;
+  int32_t  latitude;          // microgrados × 1e6 (ej. 37283115 = 37.283115°)
+  int32_t  longitude;         // microgrados × 1e6
   uint8_t  satellites;
   uint8_t  gpsFixed;
   uint8_t  currentWaypoint;
@@ -73,8 +73,8 @@ struct __attribute__((packed)) TelemetryPacket {
 
 std::vector<Waypoint> waypoints;
 
-float    robotLatitude           = 0.0;
-float    robotLongitude          = 0.0;
+double   robotLatitude           = 0.0;
+double   robotLongitude          = 0.0;
 uint8_t  robotSatellites         = 0;
 bool     robotGpsFixed           = false;
 uint8_t  robotCurrentWaypoint    = 0;
@@ -215,8 +215,8 @@ void waitForWaypoints() {
 
       int commaIndex = input.indexOf(',');
       if (commaIndex > 0) {
-        float lat = input.substring(0, commaIndex).toFloat();
-        float lon = input.substring(commaIndex + 1).toFloat();
+        double lat = input.substring(0, commaIndex).toDouble();
+        double lon = input.substring(commaIndex + 1).toDouble();
         waypoints.push_back({lat, lon});
         Serial.println("Waypoint añadido: Lat=" + String(lat, 6) + ", Lon=" + String(lon, 6));
         display.clear();
@@ -259,8 +259,8 @@ bool sendWaypointsViaLoRa() {
     packet.msgType        = MSG_WAYPOINT_DATA;
     packet.waypointId     = i + 1;
     packet.totalWaypoints = waypoints.size();
-    packet.latitude       = waypoints[i].latitude;
-    packet.longitude      = waypoints[i].longitude;
+    packet.latitude       = (int32_t)(waypoints[i].latitude  * 1e6);
+    packet.longitude      = (int32_t)(waypoints[i].longitude * 1e6);
     packet.checksum       = calculateChecksum((uint8_t*)&packet, sizeof(WaypointPacket) - 1);
 
     bool ackReceived = false;
@@ -273,8 +273,8 @@ bool sendWaypointsViaLoRa() {
       display.clear();
       display.drawString(0, 0, "Enviando WP " + String(packet.waypointId) + "/" + String(packet.totalWaypoints));
       display.drawString(0, 12, "Intento: " + String(retries + 1));
-      display.drawString(0, 24, "Lat: " + String(packet.latitude, 4));
-      display.drawString(0, 36, "Lon: " + String(packet.longitude, 4));
+      display.drawString(0, 24, "Lat: " + String(packet.latitude / 1e6, 4));
+      display.drawString(0, 36, "Lon: " + String(packet.longitude / 1e6, 4));
       display.display();
 
       delay(POST_SEND_DELAY);
@@ -353,8 +353,8 @@ void processTelemetry(uint8_t* data, int size) {
     return;
   }
 
-  robotLatitude           = packet->latitude;
-  robotLongitude          = packet->longitude;
+  robotLatitude           = packet->latitude  / 1e6;
+  robotLongitude          = packet->longitude / 1e6;
   robotSatellites         = packet->satellites;
   robotGpsFixed           = packet->gpsFixed;
   robotCurrentWaypoint    = packet->currentWaypoint;
