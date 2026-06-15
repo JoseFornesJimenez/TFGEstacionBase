@@ -1,4 +1,4 @@
-# 📡 Estación Base — AgroMqueen
+#Estación Base — AgroMqueen
 
 Firmware de la **estación base** del sistema AgroMqueen, basado en **Heltec WiFi LoRa 32 V2** (ESP32). Actúa como pasarela entre el ordenador de control (GCS) y el vehículo: recibe los waypoints por USB, los transmite al robot por LoRa con confirmación, y reenvía la telemetría que llega del robot.
 
