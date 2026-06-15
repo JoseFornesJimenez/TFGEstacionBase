@@ -10,8 +10,8 @@ Firmware de la **estación base** del sistema AgroMqueen, basado en **Heltec WiF
 El sistema completo se compone de tres repositorios:
 
 - **Estación Base (este repo)** — pasarela LoRa ↔ USB (Heltec V2).
-- **[AgroMqueen (vehículo)](<https://github.com/JoseFornesJimenez/TFGAgrooMqueen)** — robot autónomo (Heltec V3).
-- **[GCS web (mapa)](<https://github.com/JoseFornesJimenez/TFGGCS)** — interfaz Flask + Leaflet para planificar y monitorizar misiones.
+- **[AgroMqueen (vehículo)](https://github.com/JoseFornesJimenez/TFGAgrooMqueen)** — robot autónomo (Heltec V3).
+- **[GCS web (mapa)](https://github.com/JoseFornesJimenez/TFGGCS)** — interfaz Flask + Leaflet para planificar y monitorizar misiones.
 
 ```
 GCS web  ◄─ USB ─►  Estación base (este repo)  ◄─ LoRa 868 MHz ─►  Vehículo
